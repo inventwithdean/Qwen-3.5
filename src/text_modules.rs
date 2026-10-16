@@ -1,8 +1,8 @@
 use burn::{
     Tensor,
     config::Config,
-    module::Module,
-    tensor::{Device, Int, s},
+    module::{Module, Param},
+    tensor::{Device, Int, activation::silu, s},
 };
 
 use crate::text_config::TextConfig;
@@ -65,5 +65,40 @@ impl TextRotaryEmbeddingConfig {
         // 1/(base^(something)) = base^(-something) = e^ln(-something)
         let scaling_factor = -base.ln() / dim;
         (Tensor::arange_step(0..dim as i64, 2, device).float() * scaling_factor).exp()
+    }
+}
+
+// activation: silu
+#[derive(Module, Debug)]
+pub struct RMSNormGated {
+    weight: Param<Tensor<1>>, // (hidden_size,)
+    variance_epsilon: f32,
+}
+
+impl RMSNormGated {
+    pub fn forward(&self, hidden_states: Tensor<3>, gate: Tensor<3>) -> Tensor<3> {
+        // hidden_states: (B, T, hidden_size)
+        // gate: (B, T, hidden_size)
+        let variance = hidden_states.clone().square().mean_dim(2); // (B, T, 1)
+        let hidden_states = hidden_states * (variance + self.variance_epsilon).sqrt().recip(); // (B, T, hidden_size)
+        let weight = self.weight.val().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, hidden_size)
+        let hidden_states = weight * hidden_states; // (B, T, hidden_size)
+        hidden_states * silu(gate) // (B, T, hidden_size)
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct RMSNormGatedConfig {
+    hidden_size: usize,
+    eps: f32,
+}
+
+impl RMSNormGatedConfig {
+    pub fn init(&self, device: &Device) -> RMSNormGated {
+        let weight = Param::from_tensor(Tensor::<1>::ones([self.hidden_size], device));
+        RMSNormGated {
+            weight,
+            variance_epsilon: self.eps,
+        }
     }
 }
