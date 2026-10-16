@@ -2,7 +2,7 @@ use burn::{
     Tensor,
     config::Config,
     module::{Module, Param},
-    tensor::{Device, Int, activation::silu, s},
+    tensor::{Bool, Device, Int, activation::silu, module::conv1d, ops::ConvOptions, s},
 };
 
 use crate::text_config::TextConfig;
@@ -101,4 +101,69 @@ impl RMSNormGatedConfig {
             variance_epsilon: self.eps,
         }
     }
+}
+
+/// Keeps hidden states for which the mask is true
+fn apply_mask_to_padding_states(
+    hidden_states: Tensor<3>,
+    attention_mask: Option<Tensor<2, Bool>>,
+) -> Tensor<3> {
+    // hidden_states: (B, T, hidden_size)
+    // attention_mask: (B, T)
+    if let Some(mask) = attention_mask {
+        let mask = mask.unsqueeze_dim::<3>(2).float(); // (B, T, 1)
+        hidden_states * mask
+    } else {
+        hidden_states
+    }
+}
+
+fn causal_conv1d_update(
+    hidden_states: Tensor<3>,
+    conv_state: Tensor<3>,
+    weight: Tensor<2>,
+    bias: Option<Tensor<1>>,
+) -> (Tensor<3>, Tensor<3>) {
+    // hidden_states: (B, channels, seq_len)
+    // conv_state: (B, channels, state_len)
+    // weight: (channels, kernel_size)
+    // bias: (channels,)
+
+    let [_, channels, seq_len] = hidden_states.dims();
+    let state_len = conv_state.dims()[2];
+
+    let hidden_states_new = Tensor::cat(vec![conv_state, hidden_states], 2); // (B, channels, seq_len + state_len)
+    let conv_state = hidden_states_new
+        .clone()
+        .slice(s![.., .., -(state_len as i64)..]); // (B, channels, state_len)
+
+    let out = conv1d(
+        hidden_states_new,
+        weight.clone().unsqueeze_dim::<3>(1),
+        bias,
+        ConvOptions::new([1], [0], [1], channels),
+    );
+
+    let out = out.slice(s![.., .., -(seq_len as i64)..]); // (B, channels, seq_len)
+    (silu(out), conv_state)
+}
+
+fn causal_conv1d_fn(
+    hidden_states: Tensor<3>,
+    weight: Tensor<2>,
+    bias: Option<Tensor<1>>,
+) -> Tensor<3> {
+    let [_, channels, seq_len] = hidden_states.dims();
+    let padding = weight.dims()[1] - 1;
+
+    let out = conv1d(
+        hidden_states,
+        weight.unsqueeze_dim::<3>(1),
+        bias,
+        ConvOptions::new([1], [padding], [1], channels),
+    );
+    
+    let out = out.slice(s![.., .., 0..seq_len]);
+
+    silu(out)
 }
