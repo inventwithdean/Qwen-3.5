@@ -2,7 +2,14 @@ use burn::{
     Tensor,
     config::Config,
     module::{Module, Param},
-    tensor::{Bool, Device, Int, activation::silu, module::conv1d, ops::ConvOptions, s},
+    nn::{Linear, conv::Conv1d},
+    tensor::{
+        Bool, Device, Int,
+        activation::{sigmoid, silu},
+        module::conv1d,
+        ops::ConvOptions,
+        s,
+    },
 };
 
 use crate::text_config::TextConfig;
@@ -428,4 +435,191 @@ fn burn_recurrent_gated_delta_rule(
 
     core_attn_out = core_attn_out.swap_dims(1, 2);
     (core_attn_out, last_recurrent_state)
+}
+
+pub struct Cache {
+    key_states: Vec<Option<Tensor<4>>>,
+    value_states: Vec<Option<Tensor<4>>>,
+    conv_states: Vec<Option<Tensor<3>>>,
+    recurrent_states: Vec<Option<Tensor<4>>>,
+}
+
+impl Cache {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            key_states: vec![None; num_layers],
+            value_states: vec![None; num_layers],
+            conv_states: vec![None; num_layers],
+            recurrent_states: vec![None; num_layers],
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct GatedDeltaNet {
+    conv1d: Conv1d,
+    dt_bias: Param<Tensor<1>>,
+    // Named as A_log, see if safetensors mapping fails.
+    a_log: Param<Tensor<1>>,
+    norm: RMSNormGated,
+    out_proj: Linear,
+    in_proj_qkv: Linear,
+    in_proj_z: Linear,
+    in_proj_b: Linear,
+    in_proj_a: Linear,
+    layer_idx: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+}
+
+impl GatedDeltaNet {
+    fn forward(
+        &self,
+        hidden_states: Tensor<3>,
+        attention_mask: Option<Tensor<2, Bool>>,
+        mut cache: Option<&mut Cache>,
+    ) -> Tensor<3> {
+        let hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask);
+
+        let [batch_size, seq_len, _] = hidden_states.dims();
+
+        let mixed_qkv = self.in_proj_qkv.forward(hidden_states.clone());
+        let mut mixed_qkv = mixed_qkv.swap_dims(1, 2);
+
+        let z = self.in_proj_z.forward(hidden_states.clone());
+        let z = z.reshape([batch_size, seq_len, self.num_v_heads, self.head_v_dim]);
+
+        let b = self.in_proj_b.forward(hidden_states.clone());
+        let a = self.in_proj_a.forward(hidden_states.clone());
+
+        let use_precomputed_states = cache
+            .as_ref()
+            .map_or(false, |c| c.conv_states[self.layer_idx].is_some());
+
+        if use_precomputed_states && seq_len == 1 {
+            let conv_state = cache.as_ref().unwrap().conv_states[self.layer_idx]
+                .clone()
+                .unwrap();
+
+            let (out, new_conv_state) = causal_conv1d_update(
+                hidden_states,
+                conv_state,
+                self.conv1d.weight.clone().val().squeeze_dim(1),
+                self.conv1d.bias.clone().map(|bias| bias.val()),
+            );
+            mixed_qkv = out;
+            if let Some(c) = cache.as_mut() {
+                c.conv_states[self.layer_idx] = Some(new_conv_state);
+            }
+        } else {
+            let mut input_mixed_qkv = mixed_qkv.clone();
+
+            if let Some(c) = cache.as_mut() {
+                if let Some(prev_state) = &c.conv_states[self.layer_idx] {
+                    input_mixed_qkv = Tensor::cat(vec![prev_state.clone(), input_mixed_qkv], 2);
+                }
+                let padding = (self.conv1d.weight.dims()[2] - 1) as i64;
+                c.conv_states[self.layer_idx] =
+                    Some(input_mixed_qkv.clone().slice(s![.., .., -padding..]));
+            }
+
+            mixed_qkv = causal_conv1d_fn(
+                input_mixed_qkv,
+                self.conv1d.weight.val().squeeze_dim(1),
+                self.conv1d.bias.clone().map(|bias| bias.val()),
+            );
+
+            if cache.is_some() {
+                mixed_qkv = mixed_qkv.slice(s![.., .., -(seq_len as i64)..]);
+            }
+        }
+
+        mixed_qkv = mixed_qkv.swap_dims(1, 2); // (B, seq_len, key_dim * 2 + value_dim)
+
+        let key_dim = self.num_k_heads * self.head_k_dim;
+        let value_dim = self.num_v_heads * self.head_v_dim;
+
+        let query = mixed_qkv.clone().slice(s![.., .., 0..key_dim]);
+        let key = mixed_qkv.clone().slice(s![.., .., key_dim..(key_dim * 2)]);
+        let value = mixed_qkv
+            .clone()
+            .slice(s![.., .., (key_dim * 2)..(key_dim * 2 + value_dim)]);
+
+        let mut query = query.reshape([batch_size, seq_len, self.num_k_heads, self.head_k_dim]);
+        let mut key = key.reshape([batch_size, seq_len, self.num_k_heads, self.head_k_dim]);
+        let value = value.reshape([batch_size, seq_len, self.num_v_heads, self.head_v_dim]);
+
+        let beta = sigmoid(b);
+
+        let a_log_exp = self.a_log.val().exp().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
+        let dt_bias = self.dt_bias.val().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
+        let softplus = (a + dt_bias).exp().add_scalar(1.0).log();
+        let g = -a_log_exp * softplus;
+
+        if self.num_v_heads / self.num_k_heads > 1 {
+            let repeat_factor = self.num_v_heads / self.num_k_heads;
+
+            let expanded_shape = [
+                batch_size,
+                seq_len,
+                self.num_k_heads,
+                repeat_factor,
+                self.head_k_dim,
+            ];
+            let interleaved_shape = [batch_size, seq_len, self.num_v_heads, self.head_k_dim];
+            query = query
+                .unsqueeze_dim::<5>(3)
+                .expand(expanded_shape)
+                .reshape(interleaved_shape);
+            key = key
+                .unsqueeze_dim::<5>(3)
+                .expand(expanded_shape)
+                .reshape(interleaved_shape);
+        }
+
+        let recurrent_state = if use_precomputed_states {
+            cache.as_ref().unwrap().recurrent_states[self.layer_idx].clone()
+        } else {
+            None
+        };
+
+        let output_final_state = cache.is_some();
+
+        let (core_attn_out, last_recurrent_state) = if use_precomputed_states && seq_len == 1 {
+            burn_recurrent_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                recurrent_state,
+                output_final_state,
+            )
+        } else {
+            burn_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                64,
+                recurrent_state,
+                output_final_state,
+            )
+        };
+
+        if let Some(c) = cache {
+            c.recurrent_states[self.layer_idx] = last_recurrent_state;
+        }
+        let num_elements = batch_size * seq_len * self.num_v_heads;
+        let core_attn_out = core_attn_out.reshape([num_elements, self.head_v_dim]);
+        let z = z.reshape([num_elements, self.head_v_dim]);
+        let core_attn_out = self
+            .norm
+            .forward(core_attn_out.unsqueeze_dim::<3>(1), z.unsqueeze_dim::<3>(1));
+        let core_attn_out = core_attn_out.reshape([batch_size, seq_len, value_dim]);
+        self.out_proj.forward(core_attn_out)
+    }
 }
