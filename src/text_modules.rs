@@ -348,3 +348,84 @@ fn burn_chunk_gated_delta_rule(
 
     (core_attn_out, last_recurrent_state)
 }
+
+fn burn_recurrent_gated_delta_rule(
+    query: Tensor<4>,
+    key: Tensor<4>,
+    value: Tensor<4>,
+    decay: Tensor<3>,
+    beta: Tensor<3>,
+    initial_state: Option<Tensor<4>>,
+    output_final_state: bool,
+) -> (Tensor<4>, Option<Tensor<4>>) {
+    // query: (B, seq_len, num_k_heads, k_head_dim)
+    // key: (B, seq_len, num_k_heads, k_head_dim)
+    // value: (B, seq_len, num_v_heads, v_head_dim)
+    // decay: (B, seq_len, num_v_heads)
+    // beta: (B, seq_len, num_v_heads)
+    // initial_state: (B, num_v_heads, k_head_dim, v_head_dim)
+
+    let [batch_size, seq_len, num_k_heads, k_head_dim] = key.dims();
+    let [_, _, num_v_heads, v_head_dim] = value.dims();
+
+    let query = query.swap_dims(1, 2); // (B, num_k_heads, seq_len, k_head_dim)
+    let key = key.swap_dims(1, 2); // (B, num_k_heads, seq_len, k_head_dim)
+    let value = value.swap_dims(1, 2); // (B, num_v_heads, seq_len, v_head_dim)
+    let decay = decay.swap_dims(1, 2); // (B, num_v_heads, seq_len)
+    let beta = beta.swap_dims(1, 2); // (B, num_v_heads, seq_len)
+
+    let query = l2norm(query, 1e-6);
+    let key = l2norm(key, 1e-6);
+
+    let query = query * (k_head_dim as f32).powf(-0.5);
+
+    let mut last_recurrent_state = match initial_state {
+        Some(state) => state,
+        None => {
+            let recurrent_state_shape = [batch_size, num_v_heads, k_head_dim, v_head_dim];
+            Tensor::zeros(recurrent_state_shape, &query.device())
+        }
+    };
+
+    let mut core_attn_out = Tensor::zeros_like(&value); // (B, num_v_heads, seq_len, v_head_dim)
+
+    for i in 0..seq_len {
+        let q_t = query
+            .clone()
+            .slice(s![.., .., i..i + 1, ..])
+            .squeeze_dim::<3>(2); // (B, num_k_heads, k_head_dim)
+        let k_t = key.clone().slice(s![.., .., i..i + 1]).squeeze_dim::<3>(2); // (B, num_k_heads, k_head_dim)
+        let v_t = value
+            .clone()
+            .slice(s![.., .., i..i + 1])
+            .squeeze_dim::<3>(2); // (B, num_v_heads, v_head_dim)
+
+        let decay_t = decay
+            .clone()
+            .slice(s![.., .., i..i + 1])
+            .exp()
+            .unsqueeze_dim::<4>(3); // (B, num_v_heads, 1, 1)
+
+        last_recurrent_state = last_recurrent_state * decay_t;
+        let beta_t = beta.clone().slice(s![.., .., i..i + 1]); // (B, num_v_heads, 1)
+        let kv_mem = (last_recurrent_state.clone() * k_t.clone().unsqueeze_dim::<4>(3))
+            .sum_dim(2) // (B, num_v_heads, 1, v_head_dim)
+            .squeeze_dim::<3>(2); // (B, num_v_heads, v_head_dim)
+        let delta = (v_t - kv_mem) * beta_t; // (B, num_v_heads, v_head_dim)
+        last_recurrent_state =
+            last_recurrent_state + k_t.unsqueeze_dim::<4>(3) * delta.unsqueeze_dim::<4>(2);
+
+        let to_assign = (last_recurrent_state.clone() * q_t.unsqueeze_dim::<4>(3)).sum_dim(2);
+
+        core_attn_out = core_attn_out.slice_assign(s![.., .., i..i + 1, ..], to_assign);
+    }
+
+    let last_recurrent_state = if output_final_state {
+        Some(last_recurrent_state)
+    } else {
+        None
+    };
+
+    core_attn_out = core_attn_out.swap_dims(1, 2);
+    (core_attn_out, last_recurrent_state)
+}
