@@ -15,7 +15,7 @@ use burn::{
     },
 };
 
-use crate::text_config::TextConfig;
+use crate::text_config::{LayerType, TextConfig};
 
 #[derive(Module, Debug)]
 pub struct TextRotaryEmbedding {
@@ -795,6 +795,7 @@ pub struct Attention {
     head_dim: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
+    layer_idx: usize,
 }
 
 impl Attention {
@@ -803,7 +804,7 @@ impl Attention {
         hidden_states: Tensor<3>,
         position_embeddings: (Tensor<3>, Tensor<3>),
         attention_mask: Option<Tensor<4, Bool>>,
-        mut past_key_values: Option<&mut Cache>,
+        past_key_values: Option<&mut Cache>,
     ) -> Tensor<3> {
         // hidden_states: (batch_size, seq_len, head_dim)
         // both position_embeddings: (batch_size, seq_len, head_dim)
@@ -840,10 +841,23 @@ impl Attention {
             self.num_key_value_heads,
             self.head_dim,
         ]);
-        let value_states = value_states.swap_dims(1, 2);
+        let mut value_states = value_states.swap_dims(1, 2);
 
         let (cos, sin) = position_embeddings;
-        let (query_states, key_states) = apply_rotary_pos_emb(query_states, key_states, cos, sin);
+        let (query_states, mut key_states) =
+            apply_rotary_pos_emb(query_states, key_states, cos, sin);
+
+        if let Some(cache) = past_key_values {
+            if let Some(prev_k) = &cache.key_states[self.layer_idx] {
+                key_states = Tensor::cat(vec![prev_k.clone(), key_states], 2);
+            }
+            if let Some(prev_v) = &cache.value_states[self.layer_idx] {
+                value_states = Tensor::cat(vec![prev_v.clone(), value_states], 2);
+            }
+            // Store the updated states
+            cache.key_states[self.layer_idx] = Some(key_states.clone());
+            cache.value_states[self.layer_idx] = Some(value_states.clone());
+        }
 
         let num_key_value_groups = self.num_attention_heads / self.num_key_value_heads;
         let key_states = repeat_kv(key_states, num_key_value_groups);
@@ -876,7 +890,9 @@ impl Attention {
 }
 
 #[derive(Config, Debug)]
-pub struct AttentionConfig {}
+pub struct AttentionConfig {
+    layer_idx: usize,
+}
 
 impl AttentionConfig {
     pub fn init(&self, config: &TextConfig, device: &Device) -> Attention {
@@ -912,6 +928,7 @@ impl AttentionConfig {
             head_dim,
             num_attention_heads,
             num_key_value_heads,
+            layer_idx: self.layer_idx,
         }
     }
 }
@@ -952,6 +969,88 @@ impl MLPConfig {
             gate_proj,
             up_proj,
             down_proj,
+        }
+    }
+}
+
+pub enum AttentionMask {
+    Full(Tensor<4, Bool>),
+    Linear(Tensor<2, Bool>),
+}
+
+#[derive(Module, Debug)]
+pub struct DecoderLayer {
+    linear_attn: Option<GatedDeltaNet>,
+    self_attn: Option<Attention>,
+    mlp: MLP,
+    input_layernorm: RMSNorm,
+    post_attention_layernorm: RMSNorm,
+}
+
+impl DecoderLayer {
+    pub fn forward(
+        &self,
+        hidden_states: Tensor<3>,
+        position_embeddings: (Tensor<3>, Tensor<3>),
+        attention_mask: Option<AttentionMask>,
+        past_key_values: Option<&mut Cache>,
+    ) -> Tensor<3> {
+        let residual = hidden_states.clone();
+        let hidden_states = self.input_layernorm.forward(hidden_states);
+        let hidden_states = if let Some(linear_attn) = &self.linear_attn {
+            let mask = match attention_mask {
+                Some(AttentionMask::Linear(m)) => Some(m),
+                Some(_) => panic!("Expected 2D mask for linear attention"),
+                None => None,
+            };
+            linear_attn.forward(hidden_states, mask, past_key_values)
+        } else if let Some(full_attn) = &self.self_attn {
+            let mask = match attention_mask {
+                Some(AttentionMask::Full(m)) => Some(m),
+                Some(_) => panic!("Expected 4D mask for full attention"),
+                None => None,
+            };
+            full_attn.forward(hidden_states, position_embeddings, mask, past_key_values)
+        } else {
+            panic!("Decoder Layer must have either self_attn of linear_attn initialized")
+        };
+        let hidden_states = residual + hidden_states;
+        let residual = hidden_states.clone();
+        let hidden_states = self.post_attention_layernorm.forward(hidden_states);
+        let hidden_states = self.mlp.forward(hidden_states);
+        residual + hidden_states
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct DecoderLayerConfig {
+    layer_idx: usize,
+}
+
+impl DecoderLayerConfig {
+    pub fn init(&self, config: &TextConfig, device: &Device) -> DecoderLayer {
+        let hidden_size = config.hidden_size;
+        let block_type = config.layer_types[self.layer_idx].clone();
+        let rms_norm_eps = config.rms_norm_eps;
+        let linear_attn = if block_type == LayerType::LinearAttention {
+            Some(GatedDeltaNetConfig::new(self.layer_idx).init(config, device))
+        } else {
+            None
+        };
+        let self_attn = if block_type == LayerType::FullAttention {
+            Some(AttentionConfig::new(self.layer_idx).init(config, device))
+        } else {
+            None
+        };
+        let mlp = MLPConfig::new().init(config, device);
+        let input_layernorm = RMSNormConfig::new(hidden_size, rms_norm_eps).init(device);
+        let post_attention_layernorm = RMSNormConfig::new(hidden_size, rms_norm_eps).init(device);
+        DecoderLayer {
+            linear_attn,
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
         }
     }
 }

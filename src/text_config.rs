@@ -10,11 +10,12 @@ pub struct TextRopeParams {
     pub partial_rotary_factor: f32,
 }
 
-// #[derive(Serialize, Deserialize)]
-// pub enum LayerType {
-//     LinearAttention,
-//     FullAttention,
-// }
+#[derive(Serialize, Deserialize, PartialEq, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerType {
+    LinearAttention,
+    FullAttention,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct TextConfig {
@@ -29,7 +30,7 @@ pub struct TextConfig {
     pub hidden_size: usize,
     pub initializer_range: f32,
     pub intermediate_size: usize,
-    pub layer_types: Vec<String>,
+    pub layer_types: Vec<LayerType>,
     pub linear_conv_kernel_dim: usize,
     pub linear_key_head_dim: usize,
     pub linear_num_key_heads: usize,
