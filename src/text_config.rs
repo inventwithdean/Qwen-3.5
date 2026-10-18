@@ -10,6 +10,12 @@ pub struct TextRopeParams {
     pub partial_rotary_factor: f32,
 }
 
+// #[derive(Serialize, Deserialize)]
+// pub enum LayerType {
+//     LinearAttention,
+//     FullAttention,
+// }
+
 #[derive(Serialize, Deserialize)]
 pub struct TextConfig {
     pub attention_bias: bool,

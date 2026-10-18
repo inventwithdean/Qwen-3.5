@@ -2,9 +2,12 @@ use burn::{
     Tensor,
     config::Config,
     module::{Module, Param},
-    nn::{Linear, conv::Conv1d},
+    nn::{
+        Linear, LinearConfig, PaddingConfig1d,
+        conv::{Conv1d, Conv1dConfig},
+    },
     tensor::{
-        Bool, Device, Int,
+        Bool, Device, Distribution, Int,
         activation::{sigmoid, silu},
         module::conv1d,
         ops::ConvOptions,
@@ -372,7 +375,7 @@ fn burn_recurrent_gated_delta_rule(
     // beta: (B, seq_len, num_v_heads)
     // initial_state: (B, num_v_heads, k_head_dim, v_head_dim)
 
-    let [batch_size, seq_len, num_k_heads, k_head_dim] = key.dims();
+    let [batch_size, seq_len, _, k_head_dim] = key.dims();
     let [_, _, num_v_heads, v_head_dim] = value.dims();
 
     let query = query.swap_dims(1, 2); // (B, num_k_heads, seq_len, k_head_dim)
@@ -621,5 +624,129 @@ impl GatedDeltaNet {
             .forward(core_attn_out.unsqueeze_dim::<3>(1), z.unsqueeze_dim::<3>(1));
         let core_attn_out = core_attn_out.reshape([batch_size, seq_len, value_dim]);
         self.out_proj.forward(core_attn_out)
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct GatedDeltaNetConfig {
+    layer_idx: usize,
+}
+
+impl GatedDeltaNetConfig {
+    pub fn init(&self, config: &TextConfig, device: &Device) -> GatedDeltaNet {
+        let hidden_size = config.hidden_size;
+        let num_v_heads = config.linear_num_value_heads;
+        let num_k_heads = config.linear_num_key_heads;
+        let head_k_dim = config.linear_key_head_dim;
+        let head_v_dim = config.linear_value_head_dim;
+        let key_dim = head_k_dim * num_k_heads;
+        let value_dim = head_v_dim * num_v_heads;
+
+        let conv_kernel_size = config.linear_conv_kernel_dim;
+        let layer_idx = self.layer_idx;
+        let layer_norm_epsilon = config.rms_norm_eps;
+        let conv_dim = key_dim * 2 + value_dim;
+
+        let conv1d = Conv1dConfig::new(conv_dim, conv_dim, conv_kernel_size)
+            .with_bias(false)
+            .with_groups(conv_dim)
+            .with_padding(PaddingConfig1d::Explicit(
+                conv_kernel_size - 1,
+                conv_kernel_size - 1,
+            ))
+            .init(device);
+        let dt_bias = Param::from_tensor(Tensor::<1>::ones([num_v_heads], device));
+        let a = Tensor::<1>::random([num_v_heads], Distribution::Uniform(0.01, 16.0), device);
+        let a_log = Param::from_tensor(a.log());
+
+        let norm = RMSNormGatedConfig::new(head_v_dim, layer_norm_epsilon).init(device);
+        let out_proj = LinearConfig::new(value_dim, hidden_size)
+            .with_bias(false)
+            .init(device);
+
+        let in_proj_qkv = LinearConfig::new(hidden_size, key_dim * 2 + value_dim)
+            .with_bias(false)
+            .init(device);
+        let in_proj_z = LinearConfig::new(hidden_size, value_dim)
+            .with_bias(false)
+            .init(device);
+        let in_proj_b = LinearConfig::new(hidden_size, num_v_heads)
+            .with_bias(false)
+            .init(device);
+        let in_proj_a = LinearConfig::new(hidden_size, num_v_heads)
+            .with_bias(false)
+            .init(device);
+
+        GatedDeltaNet {
+            conv1d,
+            dt_bias,
+            a_log,
+            norm,
+            out_proj,
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_b,
+            in_proj_a,
+            layer_idx,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        }
+    }
+}
+
+fn rotate_half(x: Tensor<4>) -> Tensor<4> {
+    // x: (B, num_heads, seq_len, head_dim)
+    let head_dim = x.dims()[3];
+
+    let x1 = x.clone().slice(s![.., .., .., 0..head_dim / 2]);
+    let x2 = x.slice(s![.., .., .., head_dim / 2..]);
+
+    Tensor::cat(vec![-x2, x1], 3)
+}
+
+fn apply_rotary_pos_emb(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    cos: Tensor<3>,
+    sin: Tensor<3>,
+) -> (Tensor<4>, Tensor<4>) {
+    // q: (batch_size, num_heads, seq_len, head_dim)
+    // k: (batch_size, num_kv_heads, seq_len, head_dim)
+    // cos, sin: (batch_size, seq_len, rotary_dim)
+
+    let cos = cos.unsqueeze_dim::<4>(1); // (batch_size, 1, seq_len, rotary_dim)
+    let sin = sin.unsqueeze_dim::<4>(1); // (batch_size, 1, seq_len, rotary_dim)
+
+    let rotary_dim = cos.dims()[3];
+
+    let q_rot = q.clone().slice(s![.., .., .., 0..rotary_dim]);
+    let q_pass = q.slice(s![.., .., .., rotary_dim..]);
+    let k_rot = k.clone().slice(s![.., .., .., 0..rotary_dim]);
+    let k_pass = k.slice(s![.., .., .., rotary_dim..]);
+
+    let q_embed = (q_rot.clone() * cos.clone()) + (rotate_half(q_rot) * sin.clone());
+    let k_embed = (k_rot.clone() * cos) + (rotate_half(k_rot) * sin);
+    let q_embed = Tensor::cat(vec![q_embed, q_pass], 3);
+    let k_embed = Tensor::cat(vec![k_embed, k_pass], 3);
+    (q_embed, k_embed)
+}
+
+fn repeat_kv(hidden_states: Tensor<4>, repeats: usize) -> Tensor<4> {
+    // hidden_states: (batch_size, num_key_value_heads, seq_len, head_dim)
+    let [b, num_key_value_heads, seq_len, head_dim] = hidden_states.dims();
+    if repeats == 1 {
+        hidden_states
+    } else {
+        // (batch_size, num_key_value_heads, 1, seq_len, head_dim)
+        let hidden_states = hidden_states.unsqueeze_dim::<5>(2).expand([
+            b,
+            num_key_value_heads,
+            repeats,
+            seq_len,
+            head_dim,
+        ]);
+        hidden_states.reshape([b, num_key_value_heads * repeats, seq_len, head_dim])
     }
 }
