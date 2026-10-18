@@ -441,7 +441,7 @@ fn burn_recurrent_gated_delta_rule(
 }
 
 pub struct Cache {
-    key_states: Vec<Option<Tensor<4>>>,
+    pub key_states: Vec<Option<Tensor<4>>>,
     value_states: Vec<Option<Tensor<4>>>,
     conv_states: Vec<Option<Tensor<3>>>,
     recurrent_states: Vec<Option<Tensor<4>>>,
@@ -980,8 +980,8 @@ pub enum AttentionMask {
 
 #[derive(Module, Debug)]
 pub struct DecoderLayer {
-    linear_attn: Option<GatedDeltaNet>,
-    self_attn: Option<Attention>,
+    pub linear_attn: Option<GatedDeltaNet>,
+    pub self_attn: Option<Attention>,
     mlp: MLP,
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
