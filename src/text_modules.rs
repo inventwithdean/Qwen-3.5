@@ -915,3 +915,43 @@ impl AttentionConfig {
         }
     }
 }
+
+// act_fn = silu
+#[derive(Module, Debug)]
+pub struct MLP {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+impl MLP {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        let up = self.up_proj.forward(x.clone());
+        let gate = silu(self.gate_proj.forward(x));
+        self.down_proj.forward(up * gate)
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct MLPConfig {}
+
+impl MLPConfig {
+    pub fn init(&self, config: &TextConfig, device: &Device) -> MLP {
+        let hidden_size = config.hidden_size;
+        let intermediate_size = config.intermediate_size;
+        let gate_proj = LinearConfig::new(hidden_size, intermediate_size)
+            .with_bias(false)
+            .init(device);
+        let up_proj = LinearConfig::new(hidden_size, intermediate_size)
+            .with_bias(false)
+            .init(device);
+        let down_proj = LinearConfig::new(intermediate_size, hidden_size)
+            .with_bias(false)
+            .init(device);
+        MLP {
+            gate_proj,
+            up_proj,
+            down_proj,
+        }
+    }
+}
