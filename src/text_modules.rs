@@ -247,7 +247,7 @@ fn burn_chunk_gated_delta_rule(
     let decay = decay.reshape([batch_size, num_v_heads, num_chunks, chunk_size]);
 
     let strictly_upper_mask =
-        Tensor::<2, Bool>::triu_mask([chunk_size, chunk_size], 1, &query.device());
+        Tensor::<2, Bool>::triu_mask([chunk_size, chunk_size], 1, &query.device()).bool_not();
 
     let cum_decay = decay.cumsum(3); // (batch_size, num_v_heads, num_chunks, chunk_size)
 
@@ -269,7 +269,7 @@ fn burn_chunk_gated_delta_rule(
     let intra_chunk_attn = (query.clone().matmul(key.clone().swap_dims(3, 4))) * pairwise_decay;
 
     // num_k_heads and num_v_heads are same
-    // (B, num_k_heads, num_chunks, chunk_size, k_head_dim) * (B, num_v_heads, num_chunks, chunk_size, 1)
+    // (B, num_k_heads, num_chunks, chunk_size, chunk_size, 1) * (B, num_v_heads, num_chunks, chunk_size, 1)
     // => (B, num_k_heads, num_chunks, chunk_size, k_head_dim)
     let decayed_k_beta = k_beta * cum_decay.clone().exp().unsqueeze_dim::<5>(4);
 
@@ -463,13 +463,14 @@ pub struct GatedDeltaNet {
     conv1d: Conv1d,
     dt_bias: Param<Tensor<1>>,
     // Named as A_log, see if safetensors mapping fails.
-    a_log: Param<Tensor<1>>,
+    A_log: Param<Tensor<1>>,
     norm: RMSNormGated,
-    out_proj: Linear,
-    in_proj_qkv: Linear,
-    in_proj_z: Linear,
-    in_proj_b: Linear,
-    in_proj_a: Linear,
+    pub out_proj: Linear,
+    pub in_proj_qkv: Linear,
+    pub in_proj_z: Linear,
+    pub in_proj_b: Linear,
+    pub in_proj_a: Linear,
+
     layer_idx: usize,
     num_k_heads: usize,
     num_v_heads: usize,
@@ -507,7 +508,7 @@ impl GatedDeltaNet {
                 .unwrap();
 
             let (out, new_conv_state) = causal_conv1d_update(
-                hidden_states,
+                mixed_qkv,
                 conv_state,
                 self.conv1d.weight.clone().val().squeeze_dim(1),
                 self.conv1d.bias.clone().map(|bias| bias.val()),
@@ -556,9 +557,17 @@ impl GatedDeltaNet {
 
         let beta = sigmoid(b);
 
-        let a_log_exp = self.a_log.val().exp().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
+        let a_log_exp = self.A_log.val().exp().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
         let dt_bias = self.dt_bias.val().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
-        let softplus = (a + dt_bias).exp().add_scalar(1.0).log();
+        // let softplus = (a + dt_bias).exp().add_scalar(1.0).log();
+        let x_gate = a + dt_bias;
+        let softplus = x_gate
+            .clone()
+            .exp()
+            .add_scalar(1.0)
+            .log()
+            .mask_where(x_gate.clone().greater_elem(20.0), x_gate);
+
         let g = -a_log_exp * softplus;
 
         if self.num_v_heads / self.num_k_heads > 1 {
@@ -680,7 +689,7 @@ impl GatedDeltaNetConfig {
         GatedDeltaNet {
             conv1d,
             dt_bias,
-            a_log,
+            A_log: a_log,
             norm,
             out_proj,
             in_proj_qkv,
@@ -785,10 +794,10 @@ impl RMSNormConfig {
 
 #[derive(Module, Debug)]
 pub struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
 
@@ -978,11 +987,21 @@ pub enum AttentionMask {
     Linear(Tensor<2, Bool>),
 }
 
+fn timed<T>(label: &str, device: &Device, f: impl FnOnce() -> T) -> T {
+    device.sync().unwrap();
+    let t = std::time::Instant::now();
+    let out = f();
+    let enqueue = t.elapsed();
+    device.sync().unwrap();
+    println!("  {label}: enqueue {enqueue:.2?}, done {:.2?}", t.elapsed());
+    out
+}
+
 #[derive(Module, Debug)]
 pub struct DecoderLayer {
     pub linear_attn: Option<GatedDeltaNet>,
     pub self_attn: Option<Attention>,
-    mlp: MLP,
+    pub mlp: MLP,
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
 }
@@ -1018,6 +1037,53 @@ impl DecoderLayer {
         let residual = hidden_states.clone();
         let hidden_states = self.post_attention_layernorm.forward(hidden_states);
         let hidden_states = self.mlp.forward(hidden_states);
+        residual + hidden_states
+    }
+    pub fn forward_timed(
+        &self,
+        hidden_states: Tensor<3>,
+        position_embeddings: (Tensor<3>, Tensor<3>),
+        attention_mask: Option<AttentionMask>,
+        past_key_values: Option<&mut Cache>,
+    ) -> Tensor<3> {
+        let device = hidden_states.device();
+        let residual = hidden_states.clone();
+        let hidden_states = self.input_layernorm.forward(hidden_states);
+
+        let mixer_label = if self.linear_attn.is_some() {
+            "gdn"
+        } else {
+            "attn"
+        };
+
+        let hidden_states = timed(mixer_label, &device, || {
+            if let Some(linear_attn) = &self.linear_attn {
+                let mask = match attention_mask {
+                    Some(AttentionMask::Linear(m)) => Some(m),
+                    Some(_) => panic!("Expected 2D mask for linear attention"),
+                    None => None,
+                };
+                linear_attn.forward(hidden_states, mask, past_key_values)
+            } else if let Some(full_attn) = &self.self_attn {
+                let mask = match attention_mask {
+                    Some(AttentionMask::Full(m)) => Some(m),
+                    Some(_) => panic!("Expected 4D mask for full attention"),
+                    None => None,
+                };
+                full_attn.forward(hidden_states, position_embeddings, mask, past_key_values)
+            } else {
+                panic!("Decoder Layer must have either self_attn of linear_attn initialized")
+            }
+        });
+
+        let hidden_states = residual + hidden_states;
+        let residual = hidden_states.clone();
+
+        let hidden_states = timed("norm+mlp", &device, || {
+            let h = self.post_attention_layernorm.forward(hidden_states);
+            self.mlp.forward(h)
+        });
+
         residual + hidden_states
     }
 }
