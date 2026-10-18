@@ -9,8 +9,8 @@ use burn::{
     tensor::{
         Bool, Device, Distribution, Int,
         activation::{sigmoid, silu},
-        module::conv1d,
-        ops::ConvOptions,
+        module::{attention, conv1d},
+        ops::{AttentionModuleOptions, ConvOptions},
         s,
     },
 };
@@ -748,5 +748,170 @@ fn repeat_kv(hidden_states: Tensor<4>, repeats: usize) -> Tensor<4> {
             head_dim,
         ]);
         hidden_states.reshape([b, num_key_value_heads * repeats, seq_len, head_dim])
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct RMSNorm {
+    weight: Param<Tensor<1>>,
+    eps: f32,
+}
+
+impl RMSNorm {
+    pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
+        let output = x.clone() * (x.square().mean_dim(D - 1) + self.eps).sqrt().recip();
+        let mut weight_shape = [1; D];
+        weight_shape[D - 1] = self.weight.dims()[0];
+
+        let output = output * (1.0 + self.weight.val().reshape(weight_shape));
+        output
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct RMSNormConfig {
+    dim: usize,
+    eps: f32,
+}
+
+impl RMSNormConfig {
+    pub fn init(&self, device: &Device) -> RMSNorm {
+        RMSNorm {
+            weight: Param::from_tensor(Tensor::zeros([self.dim], device)),
+            eps: self.eps,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct Attention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+
+    head_dim: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+}
+
+impl Attention {
+    pub fn forward(
+        &self,
+        hidden_states: Tensor<3>,
+        position_embeddings: (Tensor<3>, Tensor<3>),
+        attention_mask: Option<Tensor<4, Bool>>,
+        mut past_key_values: Option<&mut Cache>,
+    ) -> Tensor<3> {
+        // hidden_states: (batch_size, seq_len, head_dim)
+        // both position_embeddings: (batch_size, seq_len, head_dim)
+        // attention_mask: (batch_size, seq_len)
+        let [batch_size, seq_len, _] = hidden_states.dims();
+
+        let q_proj = self.q_proj.forward(hidden_states.clone()).reshape([
+            batch_size,
+            seq_len,
+            self.num_attention_heads,
+            self.head_dim * 2,
+        ]);
+        let query_states_gate = q_proj.chunk(2, 3);
+        let query_states = query_states_gate[0].clone(); // (batch_size, seq_len, num_attention_heads, head_dim)
+        let gate = query_states_gate[1].clone(); // (batch_size, seq_len, num_attention_heads, head_dim)
+
+        let gate = gate.reshape([
+            batch_size,
+            seq_len,
+            self.num_attention_heads * self.head_dim,
+        ]);
+        let query_states = self.q_norm.forward(query_states).swap_dims(1, 2);
+        let key_states = self.k_proj.forward(hidden_states.clone()).reshape([
+            batch_size,
+            seq_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        ]);
+        let key_states = self.k_norm.forward(key_states).swap_dims(1, 2);
+
+        let value_states = self.v_proj.forward(hidden_states).reshape([
+            batch_size,
+            seq_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        ]);
+        let value_states = value_states.swap_dims(1, 2);
+
+        let (cos, sin) = position_embeddings;
+        let (query_states, key_states) = apply_rotary_pos_emb(query_states, key_states, cos, sin);
+
+        let num_key_value_groups = self.num_attention_heads / self.num_key_value_heads;
+        let key_states = repeat_kv(key_states, num_key_value_groups);
+        let value_states = repeat_kv(value_states, num_key_value_groups);
+
+        // As of now, query state is: (batch_size, num_attention_heads, seq_len_q, head_dim)
+        // and key and value states: (batch_size, num_attention_heads, seq_len_k, head_dim)
+        // attention expects (batch_size, num_heads, seq_len, head_dim)
+        // In input attention mask, true means attend.
+        let attention_mask = attention_mask.map(|mask| mask.bool_not());
+
+        let attn_output = attention(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask, // true means mask.
+            None,
+            AttentionModuleOptions::default(),
+        ); // (batch_size, num_attention_heads, seq_len_q, head_dim)
+
+        let attn_output = attn_output.swap_dims(1, 2); // (batch_size, seq_len, num_attention_heads, head_dim)
+        let attn_output = attn_output.reshape([
+            batch_size,
+            seq_len,
+            self.num_attention_heads * self.head_dim,
+        ]);
+        let attn_output = attn_output * sigmoid(gate);
+        self.o_proj.forward(attn_output)
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct AttentionConfig {}
+
+impl AttentionConfig {
+    pub fn init(&self, config: &TextConfig, device: &Device) -> Attention {
+        let num_attention_heads = config.num_attention_heads;
+        let num_key_value_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim;
+        let hidden_size = config.hidden_size;
+        let attn_bias = config.attention_bias;
+        let rms_norm_eps = config.rms_norm_eps;
+
+        let q_proj = LinearConfig::new(hidden_size, num_attention_heads * head_dim * 2)
+            .with_bias(attn_bias)
+            .init(device);
+        let k_proj = LinearConfig::new(hidden_size, num_key_value_heads * head_dim)
+            .with_bias(attn_bias)
+            .init(device);
+        let v_proj = LinearConfig::new(hidden_size, num_key_value_heads * head_dim)
+            .with_bias(attn_bias)
+            .init(device);
+        let o_proj = LinearConfig::new(num_attention_heads * head_dim, hidden_size)
+            .with_bias(attn_bias)
+            .init(device);
+        let q_norm = RMSNormConfig::new(head_dim, rms_norm_eps).init(device);
+        let k_norm = RMSNormConfig::new(head_dim, rms_norm_eps).init(device);
+
+        Attention {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            head_dim,
+            num_attention_heads,
+            num_key_value_heads,
+        }
     }
 }
