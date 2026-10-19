@@ -2,8 +2,7 @@ use std::{io::Write, time::Instant};
 
 use burn::{
     Tensor,
-    module::{Module, Param, Quantizer},
-    nn::Linear,
+    module::{Module, Quantizer},
     tensor::{
         DType, Device, Int,
         quantization::{Calibration, QuantScheme, ScaleDtype},
@@ -15,22 +14,18 @@ use burn_store::{
 use qwen3_5::{model::TextForCausalLMConfig, text_config::get_text_config, text_modules::Cache};
 use tokenizers::Tokenizer;
 
-/// Max tokens the assistant may generate per reply in chat
-/// Override at runtime with QWEN_MAX_OUTPUT_TOKENS=<n>
-const MAX_OUTPUT_TOKENS: usize = 1024;
-
 fn main() {
     // _quantize_and_save();
     chat();
 }
 
-/// Multi-turn: the KV/GDN cache carries the whole conversation, so old turns
-/// are never re-prefilled. Each reply generates at most MAX_OUTPUT_TOKENS
-/// tokens (greedy/argmax) and stops early on `<|im_end|>` or
-/// EOS. Commands: `/reset` (fresh conversation), `/exit` (quit).
+/// Commands:
+/// /reset => fresh conversation
+/// /exit  => quit
 fn chat() {
     let device = Device::wgpu(Default::default());
     println!("Initializing Qwen 3.5 Text Model (chat)");
+    let max_output_tokens = 1024;
 
     let config = get_text_config();
     let model = TextForCausalLMConfig::new().init(&config, &device);
@@ -38,11 +33,6 @@ fn chat() {
 
     println!("Loading tokenizer...");
     let tokenizer = Tokenizer::from_file("tokenizer.json").expect("Failed to load tokenizer.json");
-
-    let max_output_tokens: usize = std::env::var("QWEN_MAX_OUTPUT_TOKENS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(MAX_OUTPUT_TOKENS);
 
     let im_end_id: u32 = tokenizer
         .token_to_id("<|im_end|>")
@@ -81,7 +71,9 @@ fn chat() {
         }
 
         let turn = if turns == 0 {
-            format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n")
+            format!(
+                "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
+            )
         } else {
             format!("\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n")
         };
@@ -105,20 +97,29 @@ fn chat() {
 
         let gen_start = Instant::now();
         let mut produced = 0usize;
+        let mut generated: Vec<u32> = Vec::new();
+        let mut printed_chars = 0usize;
 
         for _ in 0..max_output_tokens {
-            let token_id: u32 = next_token
-                .clone()
-                .into_data()
-                .try_to_vec::<i32>()
-                .unwrap()[0] as u32;
+            let token_id: u32 =
+                next_token.clone().into_data().try_to_vec::<i32>().unwrap()[0] as u32;
             if token_id == im_end_id || token_id == eos_id {
                 break;
             }
+            generated.push(token_id);
 
-            let token_str = tokenizer.decode(&[token_id], true).unwrap();
-            print!("{token_str}");
-            std::io::stdout().flush().unwrap();
+            let decoded = tokenizer.decode(&generated, true).unwrap();
+            let mut new_text: String = decoded.chars().skip(printed_chars).collect();
+            if new_text.ends_with('\u{FFFD}') {
+                new_text.pop();
+                printed_chars = decoded.chars().count() - 1;
+            } else {
+                printed_chars = decoded.chars().count();
+            }
+            if !new_text.is_empty() {
+                print!("{new_text}");
+                std::io::stdout().flush().unwrap();
+            }
             produced += 1;
             total_tokens += 1;
 
@@ -126,20 +127,31 @@ fn chat() {
             next_token = logits.argmax(2).reshape([1, 1]);
         }
 
+        let tail: String = tokenizer
+            .decode(&generated, true)
+            .unwrap()
+            .chars()
+            .skip(printed_chars)
+            .collect();
+        print!("{tail}");
+        std::io::stdout().flush().unwrap();
+
         let stop = [im_end_id as i32];
-        let im_end_t =
-            Tensor::<1, Int>::from_ints(stop.as_slice(), &device).unsqueeze_dim::<2>(0);
+        let im_end_t = Tensor::<1, Int>::from_ints(stop.as_slice(), &device).unsqueeze_dim::<2>(0);
         model.forward(im_end_t, None, None, Some(&mut cache));
         total_tokens += 1;
 
         println!();
         let secs = gen_start.elapsed().as_secs_f64();
-        let speed = if secs > 0.0 { produced as f64 / secs } else { 0.0 };
+        let speed = if secs > 0.0 {
+            produced as f64 / secs
+        } else {
+            0.0
+        };
         println!("[{produced} tok, {speed:.1} tok/s, ctx ~{total_tokens} tok]");
         turns += 1;
     }
 }
-
 
 fn _quantize_and_save() {
     let device = Device::wgpu(Default::default());
@@ -151,6 +163,7 @@ fn _quantize_and_save() {
         SafetensorsStore::from_file("./model.safetensors-00001-of-00001.safetensors")
             .with_from_adapter(adapter)
             .with_key_remapping(r"^model\.", "")
+            .with_key_remapping(r"\.A_log", ".a_log")
             .with_regex(pattern)
             .allow_partial(true)
     };
@@ -158,23 +171,15 @@ fn _quantize_and_save() {
     let scheme = QuantScheme::default().per_block([64], ScaleDtype::F32);
     let mut quantizer = Quantizer::new(Calibration::MinMax, scheme);
 
-    // 1. Embedding + norm first, while the GPU is nearly empty
     let mut store = make_store(r"^(model\.)?language_model\.(embed_tokens|norm)\.");
     let result = model.load_from(&mut store).unwrap();
-    println!("embed+norm: applied {}", result.applied.len()); // expect 2
-    device.sync().unwrap();
+    println!("embed+norm: applied {}", result.applied.len());
 
-    let w = model
+    model.language_model.embed_tokens = model
         .language_model
         .embed_tokens
-        .weight
-        .val()
-        .swap_dims(0, 1);
-    model.lm_head = Linear {
-        weight: Param::from_tensor(w),
-        bias: None,
-    }
-    .quantize_weights(&mut quantizer);
+        .quantize_weights(&mut quantizer);
+
     device.sync().unwrap();
 
     for i in 0..config.num_hidden_layers {
@@ -184,16 +189,25 @@ fn _quantize_and_save() {
 
         let layer = &mut model.language_model.layers[i];
         layer.mlp = layer.mlp.clone().quantize_weights(&mut quantizer);
-        if let Some(a) = &mut layer.self_attn {
-            a.q_proj = a.q_proj.clone().quantize_weights(&mut quantizer);
-            a.k_proj = a.k_proj.clone().quantize_weights(&mut quantizer);
-            a.v_proj = a.v_proj.clone().quantize_weights(&mut quantizer);
-            a.o_proj = a.o_proj.clone().quantize_weights(&mut quantizer);
+        if let Some(self_attn) = &mut layer.self_attn {
+            self_attn.q_proj = self_attn.q_proj.clone().quantize_weights(&mut quantizer);
+            self_attn.k_proj = self_attn.k_proj.clone().quantize_weights(&mut quantizer);
+            self_attn.v_proj = self_attn.v_proj.clone().quantize_weights(&mut quantizer);
+            self_attn.o_proj = self_attn.o_proj.clone().quantize_weights(&mut quantizer);
         }
-        if let Some(l) = &mut layer.linear_attn {
-            l.in_proj_qkv = l.in_proj_qkv.clone().quantize_weights(&mut quantizer);
-            l.out_proj = l.out_proj.clone().quantize_weights(&mut quantizer);
-            l.in_proj_z = l.in_proj_z.clone().quantize_weights(&mut quantizer);
+        if let Some(linear_attn) = &mut layer.linear_attn {
+            linear_attn.in_proj_qkv = linear_attn
+                .in_proj_qkv
+                .clone()
+                .quantize_weights(&mut quantizer);
+            linear_attn.out_proj = linear_attn
+                .out_proj
+                .clone()
+                .quantize_weights(&mut quantizer);
+            linear_attn.in_proj_z = linear_attn
+                .in_proj_z
+                .clone()
+                .quantize_weights(&mut quantizer);
         }
         device.sync().unwrap();
     }

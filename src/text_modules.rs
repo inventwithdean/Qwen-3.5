@@ -462,8 +462,8 @@ impl Cache {
 pub struct GatedDeltaNet {
     conv1d: Conv1d,
     dt_bias: Param<Tensor<1>>,
-    // Named as A_log, see if safetensors mapping fails.
-    A_log: Param<Tensor<1>>,
+    // Named as A_log, have to remap
+    a_log: Param<Tensor<1>>,
     norm: RMSNormGated,
     pub out_proj: Linear,
     pub in_proj_qkv: Linear,
@@ -557,7 +557,7 @@ impl GatedDeltaNet {
 
         let beta = sigmoid(b);
 
-        let a_log_exp = self.A_log.val().exp().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
+        let a_log_exp = self.a_log.val().exp().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
         let dt_bias = self.dt_bias.val().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
         // let softplus = (a + dt_bias).exp().add_scalar(1.0).log();
         let x_gate = a + dt_bias;
@@ -689,7 +689,7 @@ impl GatedDeltaNetConfig {
         GatedDeltaNet {
             conv1d,
             dt_bias,
-            A_log: a_log,
+            a_log,
             norm,
             out_proj,
             in_proj_qkv,

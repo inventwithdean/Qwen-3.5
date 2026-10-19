@@ -162,23 +162,9 @@ impl TextModelConfig {
 #[derive(Module, Debug)]
 pub struct TextForCausalLM {
     pub language_model: TextModel,
-    pub lm_head: Linear,
 }
 
 impl TextForCausalLM {
-    pub fn forward_old(
-        &self,
-        input_ids: Tensor<2, Int>,
-        attention_mask: Option<Tensor<2, Bool>>,
-        position_ids: Option<Tensor<3, Int>>,
-        past_key_values: Option<&mut Cache>,
-    ) -> Tensor<3> {
-        let hidden_states =
-            self.language_model
-                .forward(input_ids, attention_mask, position_ids, past_key_values);
-
-        self.lm_head.forward(hidden_states)
-    }
     pub fn forward(
         &self,
         input_ids: Tensor<2, Int>,
@@ -189,7 +175,13 @@ impl TextForCausalLM {
         let hidden_states =
             self.language_model
                 .forward(input_ids, attention_mask, position_ids, past_key_values);
-        self.lm_head.forward(hidden_states)
+        let lm_head = self
+            .language_model
+            .embed_tokens
+            .weight
+            .val()
+            .swap_dims(0, 1); // (hidden_size, vocab_size)
+        hidden_states.matmul(lm_head.unsqueeze_dim(0)) // (B, seq_len, vocab_size)
     }
 }
 
@@ -199,12 +191,6 @@ pub struct TextForCausalLMConfig {}
 impl TextForCausalLMConfig {
     pub fn init(&self, config: &TextConfig, device: &Device) -> TextForCausalLM {
         let language_model = TextModelConfig::new().init(config, device);
-        let lm_head = LinearConfig::new(config.hidden_size, config.vocab_size)
-            .with_bias(false)
-            .init(device);
-        TextForCausalLM {
-            language_model,
-            lm_head,
-        }
+        TextForCausalLM { language_model }
     }
 }
