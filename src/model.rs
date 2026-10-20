@@ -1,8 +1,10 @@
+use std::time::Instant;
+
 use burn::{
     Tensor,
     config::Config,
     module::Module,
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
+    nn::{Embedding, EmbeddingConfig},
     tensor::{Bool, Device, Int},
 };
 
@@ -100,7 +102,10 @@ impl TextModel {
         });
         let total_len = past_len + seq_len;
 
-        let mut hidden_states = self.embed_tokens.forward(input_ids);
+        let embeddings = self.embed_tokens.weight.val();
+
+        let mut hidden_states =
+            crate::kernels::quant_embeddings(embeddings.clone(), input_ids).unsqueeze_dim::<3>(0);
 
         let position_ids = match position_ids {
             Some(ids) => ids,

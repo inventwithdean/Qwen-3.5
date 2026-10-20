@@ -175,10 +175,14 @@ fn _quantize_and_save() {
     let result = model.load_from(&mut store).unwrap();
     println!("embed+norm: applied {}", result.applied.len());
 
+    // Quantized using per-tensor scale for ease of learning
+    let embed_scheme = QuantScheme::default();
+    let mut embed_quantizer = Quantizer::new(Calibration::MinMax, embed_scheme);
+
     model.language_model.embed_tokens = model
         .language_model
         .embed_tokens
-        .quantize_weights(&mut quantizer);
+        .quantize_weights(&mut embed_quantizer);
 
     device.sync().unwrap();
 
