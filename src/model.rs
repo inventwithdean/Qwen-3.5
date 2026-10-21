@@ -3,8 +3,8 @@ use std::time::Instant;
 use burn::{
     Tensor,
     config::Config,
-    module::Module,
-    nn::{Embedding, EmbeddingConfig},
+    module::{Module, Param},
+    nn::{Embedding, EmbeddingConfig, Linear},
     tensor::{Bool, Device, Int},
 };
 
@@ -180,13 +180,19 @@ impl TextForCausalLM {
         let hidden_states =
             self.language_model
                 .forward(input_ids, attention_mask, position_ids, past_key_values);
+        let device = hidden_states.device();
+        // device.sync().unwrap();
+        // let timer = Instant::now();
         let lm_head = self
             .language_model
             .embed_tokens
             .weight
             .val()
             .swap_dims(0, 1); // (hidden_size, vocab_size)
-        hidden_states.matmul(lm_head.unsqueeze_dim(0)) // (B, seq_len, vocab_size)
+        let out = hidden_states.matmul(lm_head.unsqueeze_dim(0)); // (B, seq_len, vocab_size)
+        // device.sync().unwrap();
+        // println!("Elapsed: {:?}", timer.elapsed());
+        out
     }
 }
 
@@ -196,6 +202,7 @@ pub struct TextForCausalLMConfig {}
 impl TextForCausalLMConfig {
     pub fn init(&self, config: &TextConfig, device: &Device) -> TextForCausalLM {
         let language_model = TextModelConfig::new().init(config, device);
+
         TextForCausalLM { language_model }
     }
 }

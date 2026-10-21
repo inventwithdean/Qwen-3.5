@@ -3,15 +3,18 @@ use std::{io::Write, time::Instant};
 use burn::{
     Tensor,
     module::{Module, Quantizer},
+    store::ModuleRecord,
     tensor::{
-        DType, Device, Int,
+        DType, Device, Distribution, Int,
         quantization::{Calibration, QuantScheme, ScaleDtype},
     },
 };
 use burn_store::{
     FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
 };
-use qwen3_5::{model::TextForCausalLMConfig, text_config::get_text_config, text_modules::Cache};
+use qwen3_5::{
+    kernels, model::TextForCausalLMConfig, text_config::get_text_config, text_modules::Cache,
+};
 use tokenizers::Tokenizer;
 
 fn main() {
@@ -30,7 +33,6 @@ fn chat() {
     let config = get_text_config();
     let model = TextForCausalLMConfig::new().init(&config, &device);
     let model = model.load_file("./model.bpk");
-
     println!("Loading tokenizer...");
     let tokenizer = Tokenizer::from_file("tokenizer.json").expect("Failed to load tokenizer.json");
 
@@ -215,6 +217,5 @@ fn _quantize_and_save() {
         }
         device.sync().unwrap();
     }
-
     model.save_file("./model.bpk").unwrap();
 }

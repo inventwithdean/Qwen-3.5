@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use burn::{
     Tensor,
     config::Config,
@@ -15,7 +17,10 @@ use burn::{
     },
 };
 
-use crate::text_config::{LayerType, TextConfig};
+use crate::{
+    kernels,
+    text_config::{LayerType, TextConfig},
+};
 
 #[derive(Module, Debug)]
 pub struct TextRotaryEmbedding {
@@ -374,7 +379,6 @@ fn burn_recurrent_gated_delta_rule(
     // decay: (B, seq_len, num_v_heads)
     // beta: (B, seq_len, num_v_heads)
     // initial_state: (B, num_v_heads, k_head_dim, v_head_dim)
-
     let [batch_size, seq_len, _, k_head_dim] = key.dims();
     let [_, _, num_v_heads, v_head_dim] = value.dims();
 
@@ -488,11 +492,24 @@ impl GatedDeltaNet {
         let hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask);
 
         let [batch_size, seq_len, _] = hidden_states.dims();
-
-        let mixed_qkv = self.in_proj_qkv.forward(hidden_states.clone());
+        // hidden_states: (1, 1, 2048) F32
+        // in_proj_qkv: (2048, 6144) => (2048, 1536) Q8F packed with (2048, 96)
+        // 64 numbers get 1 scale, 6144 numbers get 96 scales
+        // kernel needs to do (1, 1, 2048) @ (2048, 6144) => (1, 1, 6144)
+        // let mixed_qkv = self.in_proj_qkv.forward(hidden_states.clone());
+        let mixed_qkv = if seq_len == 1 {
+            kernels::q8_gemv_partial_sum(hidden_states.clone(), self.in_proj_qkv.weight.val())
+        } else {
+            self.in_proj_qkv.forward(hidden_states.clone())
+        };
         let mut mixed_qkv = mixed_qkv.swap_dims(1, 2);
 
-        let z = self.in_proj_z.forward(hidden_states.clone());
+        // let z = self.in_proj_z.forward(hidden_states.clone());
+        let z = if seq_len == 1 {
+            kernels::q8_gemv_partial_sum(hidden_states.clone(), self.in_proj_z.weight.val())
+        } else {
+            self.in_proj_z.forward(hidden_states.clone())
+        };
         let z = z.reshape([batch_size, seq_len, self.num_v_heads, self.head_v_dim]);
 
         let b = self.in_proj_b.forward(hidden_states.clone());
@@ -513,6 +530,7 @@ impl GatedDeltaNet {
                 self.conv1d.weight.clone().val().squeeze_dim(1),
                 self.conv1d.bias.clone().map(|bias| bias.val()),
             );
+
             mixed_qkv = out;
             if let Some(c) = cache.as_mut() {
                 c.conv_states[self.layer_idx] = Some(new_conv_state);
@@ -625,6 +643,7 @@ impl GatedDeltaNet {
         if let Some(c) = cache {
             c.recurrent_states[self.layer_idx] = last_recurrent_state;
         }
+
         let num_elements = batch_size * seq_len * self.num_v_heads;
         let core_attn_out = core_attn_out.reshape([num_elements, self.head_v_dim]);
         let z = z.reshape([num_elements, self.head_v_dim]);
@@ -632,7 +651,13 @@ impl GatedDeltaNet {
             .norm
             .forward(core_attn_out.unsqueeze_dim::<3>(1), z.unsqueeze_dim::<3>(1));
         let core_attn_out = core_attn_out.reshape([batch_size, seq_len, value_dim]);
-        self.out_proj.forward(core_attn_out)
+        // let out = self.out_proj.forward(core_attn_out);
+        let out = if seq_len == 1 {
+            kernels::q8_gemv_partial_sum(core_attn_out, self.out_proj.weight.val())
+        } else {
+            self.out_proj.forward(core_attn_out)
+        };
+        out
     }
 }
 
@@ -820,7 +845,13 @@ impl Attention {
         // attention_mask: (batch_size, seq_len)
         let [batch_size, seq_len, _] = hidden_states.dims();
 
-        let q_proj = self.q_proj.forward(hidden_states.clone()).reshape([
+        // let q_proj = self.q_proj.forward(hidden_states.clone());
+        let q_proj = if seq_len == 1 {
+            kernels::q8_gemv_partial_sum(hidden_states.clone(), self.q_proj.weight.val())
+        } else {
+            self.q_proj.forward(hidden_states.clone())
+        };
+        let q_proj = q_proj.reshape([
             batch_size,
             seq_len,
             self.num_attention_heads,
@@ -894,7 +925,13 @@ impl Attention {
             self.num_attention_heads * self.head_dim,
         ]);
         let attn_output = attn_output * sigmoid(gate);
-        self.o_proj.forward(attn_output)
+        // let out = self.o_proj.forward(attn_output);
+        let out = if seq_len == 1 {
+            kernels::q8_gemv_partial_sum(attn_output, self.o_proj.weight.val())
+        } else {
+            self.o_proj.forward(attn_output)
+        };
+        out
     }
 }
 
@@ -952,9 +989,16 @@ pub struct MLP {
 
 impl MLP {
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let up = self.up_proj.forward(x.clone());
-        let gate = silu(self.gate_proj.forward(x));
-        self.down_proj.forward(up * gate)
+        let [_, seq_len, _] = x.dims();
+        if seq_len == 1 {
+            let up = kernels::q8_gemv_partial_sum(x.clone(), self.up_proj.weight.val());
+            let gate = silu(kernels::q8_gemv_partial_sum(x, self.gate_proj.weight.val()));
+            kernels::q8_gemv_partial_sum(up * gate, self.down_proj.weight.val())
+        } else {
+            let up = self.up_proj.forward(x.clone());
+            let gate = silu(self.gate_proj.forward(x));
+            self.down_proj.forward(up * gate)
+        }
     }
 }
 
@@ -985,16 +1029,6 @@ impl MLPConfig {
 pub enum AttentionMask {
     Full(Tensor<4, Bool>),
     Linear(Tensor<2, Bool>),
-}
-
-fn timed<T>(label: &str, device: &Device, f: impl FnOnce() -> T) -> T {
-    device.sync().unwrap();
-    let t = std::time::Instant::now();
-    let out = f();
-    let enqueue = t.elapsed();
-    device.sync().unwrap();
-    println!("  {label}: enqueue {enqueue:.2?}, done {:.2?}", t.elapsed());
-    out
 }
 
 #[derive(Module, Debug)]
@@ -1033,57 +1067,11 @@ impl DecoderLayer {
         } else {
             panic!("Decoder Layer must have either self_attn of linear_attn initialized")
         };
+
         let hidden_states = residual + hidden_states;
         let residual = hidden_states.clone();
         let hidden_states = self.post_attention_layernorm.forward(hidden_states);
         let hidden_states = self.mlp.forward(hidden_states);
-        residual + hidden_states
-    }
-    pub fn forward_timed(
-        &self,
-        hidden_states: Tensor<3>,
-        position_embeddings: (Tensor<3>, Tensor<3>),
-        attention_mask: Option<AttentionMask>,
-        past_key_values: Option<&mut Cache>,
-    ) -> Tensor<3> {
-        let device = hidden_states.device();
-        let residual = hidden_states.clone();
-        let hidden_states = self.input_layernorm.forward(hidden_states);
-
-        let mixer_label = if self.linear_attn.is_some() {
-            "gdn"
-        } else {
-            "attn"
-        };
-
-        let hidden_states = timed(mixer_label, &device, || {
-            if let Some(linear_attn) = &self.linear_attn {
-                let mask = match attention_mask {
-                    Some(AttentionMask::Linear(m)) => Some(m),
-                    Some(_) => panic!("Expected 2D mask for linear attention"),
-                    None => None,
-                };
-                linear_attn.forward(hidden_states, mask, past_key_values)
-            } else if let Some(full_attn) = &self.self_attn {
-                let mask = match attention_mask {
-                    Some(AttentionMask::Full(m)) => Some(m),
-                    Some(_) => panic!("Expected 4D mask for full attention"),
-                    None => None,
-                };
-                full_attn.forward(hidden_states, position_embeddings, mask, past_key_values)
-            } else {
-                panic!("Decoder Layer must have either self_attn of linear_attn initialized")
-            }
-        });
-
-        let hidden_states = residual + hidden_states;
-        let residual = hidden_states.clone();
-
-        let hidden_states = timed("norm+mlp", &device, || {
-            let h = self.post_attention_layernorm.forward(hidden_states);
-            self.mlp.forward(h)
-        });
-
         residual + hidden_states
     }
 }

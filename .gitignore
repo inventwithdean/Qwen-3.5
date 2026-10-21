@@ -3,3 +3,4 @@
 model.bpk
 model.safetensors-00001-of-00001.safetensors
 tokenizer.json
+cubecl.log
