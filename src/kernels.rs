@@ -2,11 +2,11 @@ use burn::{
     backend::{
         Backend, Dispatch, TensorMetadata, backend_extension,
         fusion::custom::TensorSpec,
-        ops::FloatTensorOps,
+        ops::{FloatTensorOps, IntTensorOps},
         tensor::{FloatTensor, IntTensor, QuantizedTensor},
         wgpu::CubeBackend,
     },
-    tensor::{DType, FloatDType, Shape},
+    tensor::{DType, FloatDType, IntDType, Shape},
 };
 use cubecl::prelude::*;
 
@@ -246,6 +246,130 @@ fn gate_proj_kernel(
     }
 }
 
+/// This kernel needs to compute dot product with every dim
+/// Will launch vocab_size * 32 units
+#[cube(launch)]
+fn q8_lm_head_kernel(
+    hidden_states: &Tensor<f32>, // [dim]
+    embeddings: &Tensor<u32>,    // [vocab_size, dim]
+    scales: &Tensor<f32>,        // [vocab_size, dim / 64]
+    output: &mut Tensor<f32>,    // [vocab_size]
+    #[comptime] dim: usize,
+) {
+    let row = ABSOLUTE_POS / 32; // 32 lanes operate on same row, a plane
+    let lane = ABSOLUTE_POS % 32;
+    if row >= output.len() {
+        terminate!()
+    }
+    let words_per_row = dim / 4;
+    let scales_per_row = dim / 64;
+
+    let mut acc = 0.0f32;
+    // col of embedding matrix
+    // each lane will handle 64 values
+    for k in 0..(dim / 32) {
+        // lane 0 will fetch first row's first address, lane 1 will fetch first row's second address, and so on.
+        // essentially all lanes in the plane will fetch 32 values simultaneously
+        // Then at second iteration of this loop,
+        // lane 0 will fetch first row's 33rd address, lane 1 will fetch first row's 34th address, and so on.
+        // By the end, full row will be complete
+        let col = k * 32 + lane;
+        let word_idx = words_per_row * row + col / 4;
+        let shift = (u32::cast_from(col) % 4) * 8u32;
+        let word = embeddings[word_idx];
+        let raw = (word >> shift) & 255u32;
+        let is_negative = raw >= 128u32;
+        let signed = i32::cast_from(raw) - i32::cast_from(is_negative) * 256;
+        let scale_idx = row * scales_per_row + col / 64;
+        let scale = scales[scale_idx];
+        acc += f32::cast_from(signed) * hidden_states[col] * scale;
+    }
+    let total = plane_sum(acc);
+    if lane == 0 {
+        output[row] = total;
+    }
+}
+
+// Will launch vocab_size / num_scans units
+// e.g. vocab_size = 248320
+// num_scans = 8
+// Each unit only compares 8 addresses => 31040 units
+// We will launch 31040 units
+#[cube(launch)]
+fn argmax_partial_kernel(
+    logits: &Tensor<f32>,             // [vocab_size]
+    output: &mut Tensor<f32>,         // [vocab_size / num_scans]
+    output_indices: &mut Tensor<i32>, // [vocab_size / num_scans]
+    #[comptime] vocab_size: usize,
+    #[comptime] num_scans: usize, // number of addresses one unit has to look up
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= vocab_size / num_scans {
+        terminate!()
+    }
+    let chunk_size = vocab_size / num_scans; // 31040
+    let mut max = logits[pos];
+    let mut max_idx = pos;
+    for k in 1..num_scans {
+        let idx = k * chunk_size + ABSOLUTE_POS; // unit 0 will look at addresses 0, 31040, 62080, ... 217280
+        // unit 31039 will look at addresses 31039, 62079, 93119, ... 248319
+        let value = logits[idx];
+        if value > max {
+            max = value;
+            max_idx = idx;
+        }
+    }
+
+    output[pos] = max;
+    output_indices[pos] = i32::cast_from(max_idx);
+}
+
+// 256 threads, 1 block
+// e.g. this is 31040 according to the kernel above with vocab_size = 248320 and num_scans = 8
+// dim = 31040
+#[cube(launch)]
+fn argmax_final(
+    partial: &Tensor<f32>,         // [dim]
+    partial_indices: &Tensor<i32>, // [dim]
+    output: &mut Tensor<i32>,      // [1]
+    #[comptime] dim: usize,
+) {
+    let pos = ABSOLUTE_POS;
+    // Need coalescing again
+    let num_scans = dim.div_ceil(256); // How many addresses each unit will look at
+    let mut shared_partial = Shared::<[f32]>::new_slice(256usize);
+    let mut shared_partial_indices = Shared::<[i32]>::new_slice(256usize);
+    let mut max = partial[pos];
+    let mut max_idx = partial_indices[pos];
+    for k in 1..num_scans {
+        let idx = k * 256 + pos; // unit 0 will look at address 0, 256, ... 30976
+        // unit 1 will look at 1, 257, ... 30976
+        // unit 255 will look at 255, 511, ... 31231
+        if idx < dim {
+            let value = partial[idx];
+            if value > max {
+                max = value;
+                max_idx = partial_indices[idx];
+            }
+        }
+    }
+    shared_partial[pos] = max;
+    shared_partial_indices[pos] = max_idx;
+    sync_cube();
+    if pos == 0 {
+        let mut max = shared_partial[0];
+        let mut max_idx = shared_partial_indices[0];
+        for idx in 1..256 {
+            let value = shared_partial[idx];
+            if value > max {
+                max = value;
+                max_idx = shared_partial_indices[idx];
+            }
+        }
+        output[0] = max_idx;
+    }
+}
+
 #[backend_extension(Cube, Fusion)]
 pub trait CustomKernels: Backend {
     #[fusion(meta=|table: &TensorSpec, ids: &TensorSpec| {
@@ -283,6 +407,29 @@ pub trait CustomKernels: Backend {
         a_log: FloatTensor<Self>,
         dt_bias: FloatTensor<Self>,
     ) -> FloatTensor<Self>;
+
+    #[fusion(meta=|_hidden_states: &TensorSpec, embeddings: &TensorSpec|{
+        let [vocab_size, _dim] = embeddings.shape.dims::<2>();
+        TensorSpec::new(Shape::from([vocab_size]), DType::F32)
+    })]
+    fn q8_lm_head(
+        hidden_states: FloatTensor<Self>,
+        embeddings: QuantizedTensor<Self>,
+    ) -> FloatTensor<Self>;
+
+    #[fusion(meta = |logits: &TensorSpec| {
+        let [vocab_size] = logits.shape.dims::<1>();
+        (TensorSpec::new(Shape::from([vocab_size / 8]), DType::F32), TensorSpec::new(Shape::from([vocab_size / 8]), DType::I32))
+    })]
+    fn argmax_partial(logits: FloatTensor<Self>) -> (FloatTensor<Self>, IntTensor<Self>);
+
+    #[fusion(meta = |_partial: &TensorSpec, _partial_indices: &TensorSpec| {
+        TensorSpec::new(Shape::from([1]), DType::I32)
+    })]
+    fn argmax_final(
+        partial: FloatTensor<Self>,
+        partial_indices: IntTensor<Self>,
+    ) -> IntTensor<Self>;
 }
 
 impl CustomKernels for CubeBackend {
@@ -423,6 +570,94 @@ impl CustomKernels for CubeBackend {
 
         output
     }
+
+    fn q8_lm_head(
+        hidden_states: FloatTensor<Self>,
+        embeddings: QuantizedTensor<Self>,
+    ) -> FloatTensor<Self> {
+        let (values, scales) = embeddings
+            .quantized_handles()
+            .expect("Embeddings must be Q8F quantized!");
+        let client = values.client.clone();
+        let device = values.device.clone();
+        let [vocab_size, dim] = embeddings.shape().dims::<2>();
+        let output = Self::float_empty(Shape::from([vocab_size]), &device, FloatDType::F32);
+
+        let num_units = vocab_size * 32;
+        let cube_dim = CubeDim::new_3d(256, 1, 1);
+        let cube_count = CubeCount::Static((num_units as u32).div_ceil(cube_dim.x), 1, 1);
+
+        q8_lm_head_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            hidden_states.into_tensor_arg(),
+            values.into_tensor_arg(),
+            scales.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            dim,
+        );
+
+        output
+    }
+
+    fn argmax_partial(logits: FloatTensor<Self>) -> (FloatTensor<Self>, IntTensor<Self>) {
+        let device = logits.device.clone();
+        let client = logits.client.clone();
+        let [vocab_size] = logits.shape().dims::<1>();
+        let num_scans = 8;
+        let output = Self::float_empty(
+            Shape::from([vocab_size / num_scans]),
+            &device,
+            FloatDType::F32,
+        );
+        // Have to include burn::backend::ops::IntTensorOps
+        let output_indices = Self::int_empty(
+            Shape::from([vocab_size / num_scans]),
+            &device,
+            IntDType::I32,
+        );
+        let num_units = vocab_size / num_scans;
+        let cube_dim = CubeDim::new_3d(256, 1, 1);
+        let cube_count = CubeCount::Static((num_units as u32).div_ceil(cube_dim.x), 1, 1);
+
+        argmax_partial_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            logits.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            output_indices.clone().into_tensor_arg(),
+            vocab_size,
+            num_scans,
+        );
+
+        (output, output_indices)
+    }
+
+    fn argmax_final(
+        partial: FloatTensor<Self>,
+        partial_indices: IntTensor<Self>,
+    ) -> IntTensor<Self> {
+        let device = partial.device.clone();
+        let client = partial.client.clone();
+        let [dim] = partial.shape().dims::<1>();
+
+        let output = Self::int_empty(Shape::from([1]), &device, IntDType::I32);
+        let cube_dim = CubeDim::new_3d(256, 1, 1);
+        let cube_count = CubeCount::Static(1, 1, 1);
+
+        argmax_final::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            partial.into_tensor_arg(),
+            partial_indices.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            dim,
+        );
+        output
+    }
 }
 
 /// embeddings: (vocab_size, emb_dim)
@@ -484,4 +719,21 @@ pub fn gate_proj(
         beta_gate_vec[0].clone().unsqueeze_dims::<3>(&[0, 1]),
         beta_gate_vec[1].clone().unsqueeze_dims::<3>(&[0, 1]),
     )
+}
+
+pub fn q8_lm_head(hidden_states: burn::Tensor<3>, embeddings: burn::Tensor<2>) -> burn::Tensor<3> {
+    let out = <Dispatch as CustomKernels>::q8_lm_head(
+        hidden_states.squeeze_dims::<1>(&[0, 1]).into_dispatch(),
+        embeddings.into_dispatch(),
+    );
+    let out = burn::Tensor::<1>::from_dispatch(out);
+    out.unsqueeze_dims::<3>(&[0, 1])
+}
+
+pub fn argmax(logits: burn::Tensor<1>) -> burn::Tensor<1, burn::tensor::Int> {
+    let (partial, partial_indices) =
+        <Dispatch as CustomKernels>::argmax_partial(logits.into_dispatch());
+    let index = <Dispatch as CustomKernels>::argmax_final(partial, partial_indices);
+    let out = burn::Tensor::<1, burn::tensor::Int>::from_dispatch(index);
+    out
 }

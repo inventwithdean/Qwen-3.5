@@ -3,5 +3,6 @@
 model.bpk
 model.safetensors-00001-of-00001.safetensors
 tokenizer.json
-cubecl.log
+with_autotune.log
+without_autotune.log
 /vendor

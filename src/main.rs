@@ -12,7 +12,9 @@ use burn_store::{
     FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
 };
 use cubecl::quant::scheme::QuantValue;
-use qwen3_5::{model::TextForCausalLMConfig, text_config::get_text_config, text_modules::Cache};
+use qwen3_5::{
+    kernels, model::TextForCausalLMConfig, text_config::get_text_config, text_modules::Cache,
+};
 use tokenizers::Tokenizer;
 
 fn main() {
@@ -124,7 +126,9 @@ fn chat() {
             total_tokens += 1;
 
             let logits = model.forward(next_token.clone(), None, None, Some(&mut cache));
-            next_token = logits.argmax(2).reshape([1, 1]);
+
+            // next_token = logits.argmax(2).reshape([1, 1]);
+            next_token = kernels::argmax(logits.squeeze_dims(&[0, 1])).reshape([1, 1]);
         }
 
         let tail: String = tokenizer
