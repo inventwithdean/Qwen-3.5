@@ -13,10 +13,10 @@ use cubecl::prelude::*;
 /// This only works for Q8F quantized embeddings
 /// We will launch n * D units
 #[cube(launch)]
-fn embedding_lookup_kernel(
+fn q8_embedding_lookup_kernel(
     table: &Tensor<u32>,      // [vocab_size, D / 4] packed Q8F words, flat
     ids: &Tensor<i32>,        // [n]
-    scales: &Tensor<f32>,     // per-tensor scale
+    scales: &Tensor<f32>,     // [vocab_size, D / 64]
     output: &mut Tensor<f32>, // [n, D]
     #[comptime] dim: usize,   // D
 ) {
@@ -40,7 +40,7 @@ fn embedding_lookup_kernel(
         let raw = (word >> shift) & 255u32; // (Masking with 255 to get actual value)
         let is_negative = raw >= 128u32; // We have to subtract 256 if we originally had a negative number
         let signed = i32::cast_from(raw) - i32::cast_from(is_negative) * 256;
-        output[pos] = f32::cast_from(signed) * scales[0];
+        output[pos] = f32::cast_from(signed) * scales[usize::cast_from(id) * (dim / 64) + col / 64];
     }
 }
 
@@ -118,7 +118,6 @@ fn q8_gemv_partial_sum_kernel(
 
     let chunk_size = in_dim / num_splits; // 512
     let row_start = chunk_size * split;
-    let row_end = row_start + chunk_size;
 
     let words_per_row = out_dim / 4;
     let mut acc = 0.0f32;
@@ -154,7 +153,7 @@ fn q8_gemv_sum_reduction_kernel(
     #[comptime] num_splits: usize,
 ) {
     let pos = ABSOLUTE_POS;
-    if pos > dim {
+    if pos >= dim {
         terminate!()
     }
     let mut acc = 0.0f32;
@@ -165,6 +164,88 @@ fn q8_gemv_sum_reduction_kernel(
     output[pos] = acc;
 }
 
+// Will launch 2 * num_splits * n_heads units
+// And 1 block
+// e.g. hidden_states: [2048]
+// w_b: [2048, 16]
+// w_a: [2048, 16]
+// a_log: [16]
+// dt_bias: [16]
+#[cube(launch)]
+fn gate_proj_kernel(
+    hidden_states: &Tensor<f32>, // [in_dim]
+    w_b: &Tensor<f32>,           // [in_dim, n_heads]
+    w_a: &Tensor<f32>,           // [in_dim, n_heads]
+    a_log: &Tensor<f32>,         // [n_heads]
+    dt_bias: &Tensor<f32>,       // [n_heads]
+    out: &mut Tensor<f32>,       // [2 * n_heads] -> half beta, half gate
+    #[comptime] in_dim: usize,
+    #[comptime] n_heads: usize,
+    #[comptime] num_splits: usize,
+) {
+    // beta then gate
+    let mut partial = Shared::<[f32]>::new_slice(num_splits * 2 * n_heads); // (num_splits, 2 * n_heads)
+    let n_out = 2 * n_heads;
+    let pos = ABSOLUTE_POS;
+    let output_idx = pos % n_heads; // 0 to 15
+    let chunk_size = in_dim / num_splits;
+    let split_idx = pos / n_out;
+    let row_start = split_idx * chunk_size;
+    let is_beta = (pos / n_heads) % 2 == 0; // Units 0 to 15 for beta, 16 to 31 for gate, 32 to 47 for beta, 48 to 61 for gate and so on
+    let mut acc = 0.0f32;
+    let u = 8usize;
+    if is_beta {
+        for blk in 0..(chunk_size / u) {
+            #[unroll]
+            for j in 0..u {
+                let row = row_start + blk * u + j;
+                let weight_idx = n_heads * row + output_idx;
+                acc += hidden_states[row] * w_b[weight_idx];
+            }
+        }
+        partial[2 * n_heads * split_idx + output_idx] = acc;
+    } else {
+        for blk in 0..(chunk_size / u) {
+            #[unroll]
+            for j in 0..u {
+                let row = row_start + blk * u + j;
+                let weight_idx = n_heads * row + output_idx;
+                acc += hidden_states[row] * w_a[weight_idx];
+            }
+        }
+        partial[2 * n_heads * split_idx + output_idx + n_heads] = acc;
+    }
+    sync_cube(); // barrier so that every partial sum is there
+    if split_idx == 0 {
+        if is_beta {
+            // sigmoid(b) => 1 / (1 + exp(-b))
+            let mut sum = 0.0f32; // b
+            #[unroll]
+            for i in 0..num_splits {
+                let partial_idx = n_out * i + output_idx;
+                sum += partial[partial_idx];
+            }
+            let sigmoid = 1.0 / (1.0 + (-sum).exp());
+            out[output_idx] = sigmoid;
+        } else {
+            let mut sum = 0.0f32; // a
+            #[unroll]
+            for i in 0..num_splits {
+                let partial_idx = n_out * i + output_idx + n_heads;
+                sum += partial[partial_idx];
+            }
+            let x_gate = sum + dt_bias[output_idx];
+            let pre_softplus = (x_gate.exp() + 1.0).ln();
+            let softplus = if pre_softplus > 20.0 {
+                x_gate
+            } else {
+                pre_softplus
+            };
+            out[output_idx + n_heads] = -a_log[output_idx].exp() * softplus;
+        }
+    }
+}
+
 #[backend_extension(Cube, Fusion)]
 pub trait CustomKernels: Backend {
     #[fusion(meta=|table: &TensorSpec, ids: &TensorSpec| {
@@ -172,7 +253,8 @@ pub trait CustomKernels: Backend {
         let [_v, dim] = table.shape.dims::<2>();
         TensorSpec::new(Shape::from([n, dim]), DType::F32)
     })]
-    fn quant_embedding(table: QuantizedTensor<Self>, ids: IntTensor<Self>) -> FloatTensor<Self>;
+    fn q8_embedding_lookup(table: QuantizedTensor<Self>, ids: IntTensor<Self>)
+    -> FloatTensor<Self>;
     #[fusion(meta=|_hidden_states: &TensorSpec, weights: &TensorSpec| {
         let [_in_dim, out_dim] = weights.shape.dims::<2>();
         TensorSpec::new(Shape::from([out_dim]), DType::F32)
@@ -189,10 +271,25 @@ pub trait CustomKernels: Backend {
         hidden_states: FloatTensor<Self>,
         weights: QuantizedTensor<Self>,
     ) -> FloatTensor<Self>;
+
+    #[fusion(meta=|_hidden_states: &TensorSpec, w_b: &TensorSpec, _w_a: &TensorSpec, _a_log: &TensorSpec, _dt_bias: &TensorSpec| {
+        let [_in_dim, n_heads] = w_b.shape.dims::<2>();
+        TensorSpec::new(Shape::from([2 * n_heads]), DType::F32)
+    })]
+    fn gate_proj(
+        hidden_states: FloatTensor<Self>,
+        w_b: FloatTensor<Self>,
+        w_a: FloatTensor<Self>,
+        a_log: FloatTensor<Self>,
+        dt_bias: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
 }
 
 impl CustomKernels for CubeBackend {
-    fn quant_embedding(table: QuantizedTensor<Self>, ids: IntTensor<Self>) -> FloatTensor<Self> {
+    fn q8_embedding_lookup(
+        table: QuantizedTensor<Self>,
+        ids: IntTensor<Self>,
+    ) -> FloatTensor<Self> {
         let (values, scales) = table
             .quantized_handles()
             .expect("Embedding table must be QFloat");
@@ -208,7 +305,7 @@ impl CustomKernels for CubeBackend {
         let cube_dim = CubeDim::new_3d(256, 1, 1);
         let cube_count = CubeCount::Static(num_elements.div_ceil(cube_dim.x), 1, 1);
 
-        embedding_lookup_kernel::launch(
+        q8_embedding_lookup_kernel::launch(
             &client,
             cube_count,
             cube_dim,
@@ -291,6 +388,41 @@ impl CustomKernels for CubeBackend {
         );
         reduced
     }
+
+    fn gate_proj(
+        hidden_states: FloatTensor<Self>,
+        w_b: FloatTensor<Self>,
+        w_a: FloatTensor<Self>,
+        a_log: FloatTensor<Self>,
+        dt_bias: FloatTensor<Self>,
+    ) -> FloatTensor<Self> {
+        let client = hidden_states.client.clone();
+        let device = hidden_states.device.clone();
+        let [in_dim, n_heads] = w_b.shape().dims::<2>();
+        let output = Self::float_empty(Shape::from([2 * n_heads]), &device, FloatDType::F32);
+        let num_splits = 8;
+
+        let num_units = 2 * n_heads * num_splits;
+        let cube_dim = CubeDim::new_3d(num_units as u32, 1, 1);
+        let cube_count = CubeCount::Static(1, 1, 1);
+
+        gate_proj_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            hidden_states.into_tensor_arg(),
+            w_b.into_tensor_arg(),
+            w_a.into_tensor_arg(),
+            a_log.into_tensor_arg(),
+            dt_bias.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            in_dim,
+            n_heads,
+            num_splits,
+        );
+
+        output
+    }
 }
 
 /// embeddings: (vocab_size, emb_dim)
@@ -299,11 +431,11 @@ impl CustomKernels for CubeBackend {
 ///
 /// Currently only works with batch size 1.
 /// Make sure embeddings are tensor-scale Q8F quantized
-pub fn quant_embeddings(
+pub fn q8_embedding_lookup(
     embeddings: burn::Tensor<2>,
     input_ids: burn::Tensor<2, burn::tensor::Int>,
 ) -> burn::Tensor<2> {
-    let out = <Dispatch as CustomKernels>::quant_embedding(
+    let out = <Dispatch as CustomKernels>::q8_embedding_lookup(
         embeddings.into_dispatch(),
         input_ids.into_dispatch(),
     );
@@ -330,4 +462,26 @@ pub fn q8_gemv_partial_sum(
     );
     let out = burn::Tensor::<1>::from_dispatch(out).unsqueeze_dims::<3>(&[0, 1]);
     out
+}
+
+pub fn gate_proj(
+    hidden_states: burn::Tensor<3>,
+    w_b: burn::Tensor<2>,
+    w_a: burn::Tensor<2>,
+    a_log: burn::Tensor<1>,
+    dt_bias: burn::Tensor<1>,
+) -> (burn::Tensor<3>, burn::Tensor<3>) {
+    let out = <Dispatch as CustomKernels>::gate_proj(
+        hidden_states.squeeze_dims::<1>(&[0, 1]).into_dispatch(),
+        w_b.into_dispatch(),
+        w_a.into_dispatch(),
+        a_log.into_dispatch(),
+        dt_bias.into_dispatch(),
+    );
+    let out = burn::Tensor::<1>::from_dispatch(out);
+    let beta_gate_vec = out.chunk(2, 0);
+    (
+        beta_gate_vec[0].clone().unsqueeze_dims::<3>(&[0, 1]),
+        beta_gate_vec[1].clone().unsqueeze_dims::<3>(&[0, 1]),
+    )
 }

@@ -1,10 +1,8 @@
-use std::time::Instant;
-
 use burn::{
     Tensor,
     config::Config,
-    module::{Module, Param},
-    nn::{Embedding, EmbeddingConfig, Linear},
+    module::Module,
+    nn::{Embedding, EmbeddingConfig},
     tensor::{Bool, Device, Int},
 };
 
@@ -104,8 +102,8 @@ impl TextModel {
 
         let embeddings = self.embed_tokens.weight.val();
 
-        let mut hidden_states =
-            crate::kernels::quant_embeddings(embeddings.clone(), input_ids).unsqueeze_dim::<3>(0);
+        let mut hidden_states = crate::kernels::q8_embedding_lookup(embeddings.clone(), input_ids)
+            .unsqueeze_dim::<3>(0);
 
         let position_ids = match position_ids {
             Some(ids) => ids,
@@ -124,7 +122,6 @@ impl TextModel {
         } else {
             Some(causal_mask.expand([batch_size, 1, seq_len, total_len]))
         };
-
         for layer in self.layers.iter() {
             let layer_mask = if layer.self_attn.is_some() {
                 full_mask.clone().map(AttentionMask::Full)
@@ -180,9 +177,6 @@ impl TextForCausalLM {
         let hidden_states =
             self.language_model
                 .forward(input_ids, attention_mask, position_ids, past_key_values);
-        let device = hidden_states.device();
-        // device.sync().unwrap();
-        // let timer = Instant::now();
         let lm_head = self
             .language_model
             .embed_tokens
@@ -190,8 +184,6 @@ impl TextForCausalLM {
             .val()
             .swap_dims(0, 1); // (hidden_size, vocab_size)
         let out = hidden_states.matmul(lm_head.unsqueeze_dim(0)); // (B, seq_len, vocab_size)
-        // device.sync().unwrap();
-        // println!("Elapsed: {:?}", timer.elapsed());
         out
     }
 }

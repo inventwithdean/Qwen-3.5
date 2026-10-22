@@ -3,18 +3,16 @@ use std::{io::Write, time::Instant};
 use burn::{
     Tensor,
     module::{Module, Quantizer},
-    store::ModuleRecord,
     tensor::{
-        DType, Device, Distribution, Int,
+        DType, Device, Int,
         quantization::{Calibration, QuantScheme, ScaleDtype},
     },
 };
 use burn_store::{
     FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
 };
-use qwen3_5::{
-    kernels, model::TextForCausalLMConfig, text_config::get_text_config, text_modules::Cache,
-};
+use cubecl::quant::scheme::QuantValue;
+use qwen3_5::{model::TextForCausalLMConfig, text_config::get_text_config, text_modules::Cache};
 use tokenizers::Tokenizer;
 
 fn main() {
@@ -170,21 +168,20 @@ fn _quantize_and_save() {
             .allow_partial(true)
     };
 
-    let scheme = QuantScheme::default().per_block([64], ScaleDtype::F32);
+    let scheme = QuantScheme::default()
+        .per_block([64], ScaleDtype::F32)
+        .with_value(QuantValue::Q8F); // default is Q8F, but for visibility
+
     let mut quantizer = Quantizer::new(Calibration::MinMax, scheme);
 
     let mut store = make_store(r"^(model\.)?language_model\.(embed_tokens|norm)\.");
     let result = model.load_from(&mut store).unwrap();
     println!("embed+norm: applied {}", result.applied.len());
 
-    // Quantized using per-tensor scale for ease of learning
-    let embed_scheme = QuantScheme::default();
-    let mut embed_quantizer = Quantizer::new(Calibration::MinMax, embed_scheme);
-
     model.language_model.embed_tokens = model
         .language_model
         .embed_tokens
-        .quantize_weights(&mut embed_quantizer);
+        .quantize_weights(&mut quantizer);
 
     device.sync().unwrap();
 

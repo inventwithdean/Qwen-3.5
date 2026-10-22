@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use burn::{
     Tensor,
     config::Config,
@@ -490,7 +488,6 @@ impl GatedDeltaNet {
         mut cache: Option<&mut Cache>,
     ) -> Tensor<3> {
         let hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask);
-
         let [batch_size, seq_len, _] = hidden_states.dims();
         // hidden_states: (1, 1, 2048) F32
         // in_proj_qkv: (2048, 6144) => (2048, 1536) Q8F packed with (2048, 96)
@@ -504,16 +501,12 @@ impl GatedDeltaNet {
         };
         let mut mixed_qkv = mixed_qkv.swap_dims(1, 2);
 
-        // let z = self.in_proj_z.forward(hidden_states.clone());
         let z = if seq_len == 1 {
             kernels::q8_gemv_partial_sum(hidden_states.clone(), self.in_proj_z.weight.val())
         } else {
             self.in_proj_z.forward(hidden_states.clone())
         };
         let z = z.reshape([batch_size, seq_len, self.num_v_heads, self.head_v_dim]);
-
-        let b = self.in_proj_b.forward(hidden_states.clone());
-        let a = self.in_proj_a.forward(hidden_states.clone());
 
         let use_precomputed_states = cache
             .as_ref()
@@ -573,20 +566,34 @@ impl GatedDeltaNet {
         let mut key = key.reshape([batch_size, seq_len, self.num_k_heads, self.head_k_dim]);
         let value = value.reshape([batch_size, seq_len, self.num_v_heads, self.head_v_dim]);
 
-        let beta = sigmoid(b);
+        let (beta, g) = if seq_len == 1 {
+            kernels::gate_proj(
+                hidden_states.clone(),
+                self.in_proj_b.weight.val(),
+                self.in_proj_a.weight.val(),
+                self.a_log.val(),
+                self.dt_bias.val(),
+            )
+        } else {
+            let b = self.in_proj_b.forward(hidden_states.clone());
+            let a = self.in_proj_a.forward(hidden_states.clone());
 
-        let a_log_exp = self.a_log.val().exp().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
-        let dt_bias = self.dt_bias.val().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
-        // let softplus = (a + dt_bias).exp().add_scalar(1.0).log();
-        let x_gate = a + dt_bias;
-        let softplus = x_gate
-            .clone()
-            .exp()
-            .add_scalar(1.0)
-            .log()
-            .mask_where(x_gate.clone().greater_elem(20.0), x_gate);
+            let beta = sigmoid(b);
 
-        let g = -a_log_exp * softplus;
+            let a_log_exp = self.a_log.val().exp().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
+            let dt_bias = self.dt_bias.val().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
+            // let softplus = (a + dt_bias).exp().add_scalar(1.0).log();
+            let x_gate = a + dt_bias;
+            let softplus = x_gate
+                .clone()
+                .exp()
+                .add_scalar(1.0)
+                .log()
+                .mask_where(x_gate.clone().greater_elem(20.0), x_gate);
+
+            let g = -a_log_exp * softplus;
+            (beta, g)
+        };
 
         if self.num_v_heads / self.num_k_heads > 1 {
             let repeat_factor = self.num_v_heads / self.num_k_heads;
@@ -651,7 +658,6 @@ impl GatedDeltaNet {
             .norm
             .forward(core_attn_out.unsqueeze_dim::<3>(1), z.unsqueeze_dim::<3>(1));
         let core_attn_out = core_attn_out.reshape([batch_size, seq_len, value_dim]);
-        // let out = self.out_proj.forward(core_attn_out);
         let out = if seq_len == 1 {
             kernels::q8_gemv_partial_sum(core_attn_out, self.out_proj.weight.val())
         } else {
@@ -867,20 +873,23 @@ impl Attention {
             self.num_attention_heads * self.head_dim,
         ]);
         let query_states = self.q_norm.forward(query_states).swap_dims(1, 2);
-        let key_states = self.k_proj.forward(hidden_states.clone()).reshape([
-            batch_size,
-            seq_len,
-            self.num_key_value_heads,
-            self.head_dim,
-        ]);
+        let key_states = if seq_len == 1 {
+            kernels::q8_gemv_partial_sum(hidden_states.clone(), self.k_proj.weight.val())
+        } else {
+            self.k_proj.forward(hidden_states.clone())
+        };
+        let key_states =
+            key_states.reshape([batch_size, seq_len, self.num_key_value_heads, self.head_dim]);
         let key_states = self.k_norm.forward(key_states).swap_dims(1, 2);
 
-        let value_states = self.v_proj.forward(hidden_states).reshape([
-            batch_size,
-            seq_len,
-            self.num_key_value_heads,
-            self.head_dim,
-        ]);
+        let value_states = if seq_len == 1 {
+            kernels::q8_gemv_partial_sum(hidden_states, self.v_proj.weight.val())
+        } else {
+            self.v_proj.forward(hidden_states)
+        };
+
+        let value_states =
+            value_states.reshape([batch_size, seq_len, self.num_key_value_heads, self.head_dim]);
         let mut value_states = value_states.swap_dims(1, 2);
 
         let (cos, sin) = position_embeddings;
