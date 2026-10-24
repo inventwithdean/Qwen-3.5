@@ -54,4 +54,4 @@ cargo run --release
 
 ## License
 
-The inference code and model weights both are Apache 2.0 licensed.
+The inference code is under MIT license and model weights are Apache 2.0 licensed.
