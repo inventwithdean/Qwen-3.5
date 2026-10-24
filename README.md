@@ -1,4 +1,4 @@
-# Rust inference engine for Qwen 3.5 with hand-written CubeCL kernels
+# A Rust inference engine for Qwen 3.5 with custom CubeCL kernels
 
 Local inference for the **Qwen3.5 2B** text model, written from scratch in Rust on top of
 [Burn](https://github.com/tracel-ai/burn) and [CubeCL](https://github.com/tracel-ai/cubecl),
